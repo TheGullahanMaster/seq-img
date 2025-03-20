@@ -25,10 +25,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
-from lamb import *  # Provides TeLU, GoLU and RAdamScheduleFree – ensure lamb.py is available
+from lamb import *  # Provides TeLU and RAdamScheduleFree – ensure lamb.py is available
 from torch.nn import Linear, Module, Identity
 from torch.jit import script
 from transformers import GPT2LMHeadModel, GPT2Config
+
+#############################################
+# Custom Dataset Class
+#############################################
+import math
+import torch.nn.init as init
+
+def lecun_normal_(tensor):
+    fan_in, _ = init._calculate_fan_in_and_fan_out(tensor)
+    std = math.sqrt(1.0 / fan_in)
+    return init.normal_(tensor, 0, std)
 #############################################
 # Custom Dataset Class with Patch Mode
 #############################################
@@ -224,7 +235,7 @@ def generate_image(model, config, device):
             noise_scale = torch.clamp(torch.normal(mean=0.0, std=0.4, size=tensor.shape, device=device), -1, 1)
             return tensor + (torch.randn_like(tensor) * noise_scale)
 
-        if model_type in ["1", "2", "3", "6"]:
+        if model_type in ["1", "2", "3"]:
             start_token = torch.clamp(torch.normal(mean=0.0, std=0.4, size=(1, 1, patch_vector_dim), device=device), -1, 1)
             #torch.randn(1, 1, patch_vector_dim).to(device)# * 0.1
             current_patch = start_token
@@ -242,7 +253,7 @@ def generate_image(model, config, device):
                 sampled_patch = add_noise(output)
                 generated_patches.append(output.squeeze(0).squeeze(0).cpu().numpy())
                 current_patch = sampled_patch
-        elif model_type in ["4", "5", "7", "8", "9", "10", "11", "12"]:
+        elif model_type in ["4", "5", "6", "7", "8", "9", "10"]:
             start_token = torch.randn(1, 1, patch_vector_dim).to(device) * 0.1
             current_seq = start_token  # shape: (1, 1, patch_vector_dim)
             for i in range(num_patches):
@@ -638,7 +649,18 @@ class PatchGRU(nn.Module):
 
 
 # MLP model using TeLU activation and GPT-2 style positional embeddings
-class PatchMLP(nn.Module):
+import torch
+import torch.nn as nn
+import numpy as np
+
+# Assuming GoLU is defined or imported from elsewhere.
+# For example, one simple implementation might be:
+# class GoLU(nn.Module):
+#     def forward(self, x):
+#         return x * torch.sigmoid(x)
+
+# 1) PatchMLP with Sigmoid activations
+class PatchMLP_Sigmoid(nn.Module):
     def __init__(self, input_dim, hidden_dim, layers, max_seq_len):
         super().__init__()
         self.max_seq_len = max_seq_len
@@ -650,13 +672,180 @@ class PatchMLP(nn.Module):
             [nn.Linear(hidden_dim, hidden_dim) for _ in range(layers - 1)] +
             [nn.Linear(hidden_dim, input_dim)]
         )
-        self.activation = GoLU()
+        self.activation = nn.Sigmoid()
+        
     def forward(self, x, hidden=None):
         # x shape: (batch, seq_len, input_dim)
         seq_len = x.shape[1]
         pos_emb = self.pos_embedding[:, :seq_len, :]
-        x = self.proj(x)
-        x = x + pos_emb
+        x = self.proj(x) + pos_emb
+        for layer in self.layers[:-1]:
+            x = self.activation(layer(x))
+        return self.layers[-1](x)
+
+
+# 2) PatchMLP with Tanh activations
+class PatchMLP_Tanh(nn.Module):
+    def __init__(self, input_dim, hidden_dim, layers, max_seq_len):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, hidden_dim))
+        self.layers = nn.ModuleList(
+            [nn.Linear(hidden_dim, hidden_dim)] +
+            [nn.Linear(hidden_dim, hidden_dim) for _ in range(layers - 1)] +
+            [nn.Linear(hidden_dim, input_dim)]
+        )
+        self.activation = nn.Tanh()
+        
+    def forward(self, x, hidden=None):
+        seq_len = x.shape[1]
+        pos_emb = self.pos_embedding[:, :seq_len, :]
+        x = self.proj(x) + pos_emb
+        for layer in self.layers[:-1]:
+            x = self.activation(layer(x))
+        return self.layers[-1](x)
+
+
+# 3) PatchMLP with SELU activations (using LeCun normal init)
+class PatchMLP_SELU(nn.Module):
+    def __init__(self, input_dim, hidden_dim, layers, max_seq_len):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, hidden_dim))
+        self.layers = nn.ModuleList(
+            [nn.Linear(hidden_dim, hidden_dim)] +
+            [nn.Linear(hidden_dim, hidden_dim) for _ in range(layers - 1)] +
+            [nn.Linear(hidden_dim, input_dim)]
+        )
+        self.activation = nn.SELU()
+        self.reset_parameters()
+        
+    def reset_parameters(self):
+        if isinstance(self.proj, nn.Linear):
+            lecun_normal_(self.proj.weight)
+        for layer in self.layers:
+            if isinstance(layer, nn.Linear):
+                lecun_normal_(layer.weight)
+                
+    def forward(self, x, hidden=None):
+        seq_len = x.shape[1]
+        pos_emb = self.pos_embedding[:, :seq_len, :]
+        x = self.proj(x) + pos_emb
+        for layer in self.layers[:-1]:
+            x = self.activation(layer(x))
+        return self.layers[-1](x)
+
+
+# 4) PatchMLP with Sine activations (SIREN-style initialization)
+class PatchMLP_Sine(nn.Module):
+    def __init__(self, input_dim, hidden_dim, layers, max_seq_len, omega_0=30):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.max_seq_len = max_seq_len
+        self.proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, hidden_dim))
+        self.layers = nn.ModuleList(
+            [nn.Linear(hidden_dim, hidden_dim)] +
+            [nn.Linear(hidden_dim, hidden_dim) for _ in range(layers - 1)] +
+            [nn.Linear(hidden_dim, input_dim)]
+        )
+        # Use torch.sin as the activation
+        self.activation = torch.sin
+        self.reset_parameters()
+        
+    def reset_parameters(self):
+        # For the projection layer (if Linear) use first-layer SIREN init
+        if isinstance(self.proj, nn.Linear):
+            fan_in = self.proj.in_features
+            nn.init.uniform_(self.proj.weight, -1/fan_in, 1/fan_in)
+        # Initialize each layer with SIREN-style bounds
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, nn.Linear):
+                fan_in = layer.in_features
+                if i == 0:
+                    # First layer: uniform in [-1/fan_in, 1/fan_in]
+                    nn.init.uniform_(layer.weight, -1/fan_in, 1/fan_in)
+                else:
+                    # Subsequent layers: uniform in [-sqrt(6/fan_in)/omega_0, sqrt(6/fan_in)/omega_0]
+                    bound = np.sqrt(6 / fan_in) / self.omega_0
+                    nn.init.uniform_(layer.weight, -bound, bound)
+        
+    def forward(self, x, hidden=None):
+        seq_len = x.shape[1]
+        pos_emb = self.pos_embedding[:, :seq_len, :]
+        x = self.proj(x) + pos_emb
+        for layer in self.layers[:-1]:
+            x = self.activation(layer(x))
+        return self.layers[-1](x)
+
+
+# 5) PatchMLP with ReLU activations (using ReLU aware / Kaiming initialization)
+class PatchMLP_ReLU(nn.Module):
+    def __init__(self, input_dim, hidden_dim, layers, max_seq_len):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, hidden_dim))
+        self.layers = nn.ModuleList(
+            [nn.Linear(hidden_dim, hidden_dim)] +
+            [nn.Linear(hidden_dim, hidden_dim) for _ in range(layers - 1)] +
+            [nn.Linear(hidden_dim, input_dim)]
+        )
+        self.activation = nn.ReLU()
+        self.reset_parameters()
+        
+    def reset_parameters(self):
+        if isinstance(self.proj, nn.Linear):
+            nn.init.kaiming_normal_(self.proj.weight, nonlinearity='relu')
+        for layer in self.layers:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_normal_(layer.weight, nonlinearity='relu')
+                
+    def forward(self, x, hidden=None):
+        seq_len = x.shape[1]
+        pos_emb = self.pos_embedding[:, :seq_len, :]
+        x = self.proj(x) + pos_emb
+        for layer in self.layers[:-1]:
+            x = self.activation(layer(x))
+        return self.layers[-1](x)
+
+
+# 6) Original PatchMLP with ReLU aware init (keeping the GoLU activation)
+
+
+
+# 7) PatchMLP with Cone() activations
+# (Assuming Cone is defined in lamb.py and that its recommended init suits the 1 - |x - 1| behavior.)
+class PatchMLP_Cone(nn.Module):
+    def __init__(self, input_dim, hidden_dim, layers, max_seq_len):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, hidden_dim))
+        self.layers = nn.ModuleList(
+            [nn.Linear(hidden_dim, hidden_dim)] +
+            [nn.Linear(hidden_dim, hidden_dim) for _ in range(layers - 1)] +
+            [nn.Linear(hidden_dim, input_dim)]
+        )
+        # Import Cone activation from lamb.py.
+        from lamb import Cone
+        self.activation = Cone()
+        self.reset_parameters()
+        
+    def reset_parameters(self):
+        # Use Xavier uniform init as a reasonable default for this activation.
+        if isinstance(self.proj, nn.Linear):
+            nn.init.xavier_uniform_(self.proj.weight)
+        for layer in self.layers:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                
+    def forward(self, x, hidden=None):
+        seq_len = x.shape[1]
+        pos_emb = self.pos_embedding[:, :seq_len, :]
+        x = self.proj(x) + pos_emb
         for layer in self.layers[:-1]:
             x = self.activation(layer(x))
         return self.layers[-1](x)
@@ -708,8 +897,12 @@ class GPT2TransformerBlock(nn.Module):
         return x
 
 # Define a GPT-2 style transformer model adapted for continuous image patches.
+import torch
+import torch.nn as nn
+import math
+
 class PatchTransformer(nn.Module):
-    def __init__(self, input_dim, hidden_dim, layers, num_heads, max_seq_len):
+    def __init__(self, input_dim, hidden_dim, layers, num_heads, max_seq_len, pos_embed_type="trainable"):
         """
         Args:
             input_dim (int): Dimension of the continuous input (e.g. image patch size).
@@ -717,15 +910,26 @@ class PatchTransformer(nn.Module):
             layers (int): Number of transformer blocks.
             num_heads (int): Number of attention heads.
             max_seq_len (int): Maximum sequence length.
+            pos_embed_type (str): Type of positional embedding ("nopos", "sine", "trainable").
         """
         super().__init__()
         self.max_seq_len = max_seq_len
+        self.pos_embed_type = pos_embed_type
         
         # Project input patches into the transformer hidden space.
         self.token_embedding = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
         
-        # Learned positional embeddings in the hidden dimension.
-        self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, hidden_dim))
+        # Create positional embeddings based on type.
+        if pos_embed_type == "trainable":
+            self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, hidden_dim))
+        elif pos_embed_type == "sine":
+            # Create sinusoidal embeddings and register as a buffer so they are not updated by gradients.
+            pe = self.create_sinusoidal_embeddings(max_seq_len, hidden_dim)
+            self.register_buffer("pos_embedding", pe, persistent=False)
+        elif pos_embed_type == "nopos":
+            self.pos_embedding = None
+        else:
+            raise ValueError(f"Unknown pos_embed_type: {pos_embed_type}")
         
         # Create a stack of transformer blocks.
         self.blocks = nn.ModuleList([
@@ -736,6 +940,20 @@ class PatchTransformer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(hidden_dim)
         self.final_linear = nn.Linear(hidden_dim, input_dim)  # regression head for continuous outputs
         
+    def create_sinusoidal_embeddings(self, max_seq_len, hidden_dim):
+        """
+        Creates sinusoidal positional embeddings.
+        Returns:
+            Tensor of shape (1, max_seq_len, hidden_dim)
+        """
+        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)  # (max_seq_len, 1)
+        div_term = torch.exp(torch.arange(0, hidden_dim, 2, dtype=torch.float) * -(math.log(10000.0) / hidden_dim))
+        pe = torch.zeros(max_seq_len, hidden_dim)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_seq_len, hidden_dim)
+        return pe
+
     def forward(self, x):
         """
         Args:
@@ -749,8 +967,11 @@ class PatchTransformer(nn.Module):
         # Project input tokens into the hidden space.
         x = self.token_embedding(x)  # shape: (batch, seq_len, hidden_dim)
         
-        # Add learned positional embeddings.
-        pos_emb = self.pos_embedding[:, :seq_len, :]
+        # Add positional embeddings if applicable.
+        if self.pos_embed_type == "nopos":
+            pos_emb = 0  # No positional information added.
+        else:
+            pos_emb = self.pos_embedding[:, :seq_len, :]
         x = x + pos_emb
         
         # Create a causal mask to enforce autoregressive behavior.
@@ -766,14 +987,13 @@ class PatchTransformer(nn.Module):
         return x
 
 
+# 
+
 import torch
 import torch.nn as nn
 
 # Optional: Define an alternative activation if desired.
 # Here we simply use the standard GELU by default.
-class GoLU(nn.Module):
-    def forward(self, x):
-        return torch.nn.functional.gelu(x)
 
 # Rotary Multihead Attention (a drop-in replacement for nn.MultiheadAttention)
 class RotaryMultiheadAttention(nn.Module):
@@ -1214,78 +1434,298 @@ class DropaPath(nn.Module):
         random_tensor.floor_()  # Binarize.
         return x.div(1 - self.drop_prob) * random_tensor
 
-class ResidualPatchMLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, layers, max_seq_len, drop_path_rate=0.0):
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+
+# Placeholder implementations if not defined.
+# Assume these are defined with the appropriate behavior elsewhere.
+# For example, RMSNorm might be defined as:
+# class RMSNorm(nn.Module):
+#     def __init__(self, dim, eps=1e-8):
+#         super().__init__()
+#         self.dim = dim
+#         self.eps = eps
+#         self.weight = nn.Parameter(torch.ones(dim))
+#     def forward(self, x):
+#         norm = x.norm(dim=-1, keepdim=True)
+#         return self.weight * x / (norm + self.eps)
+#
+# Similarly, GoLU and Cone should be imported or defined.
+# Here we simply assume they exist.
+
+# A helper block that implements a single MLP layer with optional normalization,
+# activation (or GLU variant), and proper initialization.
+class FlexibleMLPBlock(nn.Module):
+    def __init__(self, linear_layer, norm_layer, act_type, act_name):
         """
-        A PatchMLP that uses residual connections with DropPath regularization.
-        Each residual branch is applied only if the layer's input and output dimensions match.
-        Otherwise (e.g., when mapping from input_dim to hidden_dim or vice versa), the
-        residual connection is omitted.
-        
         Args:
-            input_dim (int): Dimension of the input tokens.
-            hidden_dim (int): Hidden dimension of the network.
-            layers (int): Number of linear layers.
-            max_seq_len (int): Maximum sequence length (for positional embeddings).
-            drop_path_rate (float): Maximum drop path rate to apply across layers.
+            linear_layer (nn.Linear): Linear layer for this block.
+            norm_layer (nn.Module): Normalization layer.
+            act_type (str): "basic" or "glu".
+            act_name (str): Which activation to use: one of
+               "sine", "selu", "sigmoid", "tanh", "relu", "golu", "cone".
+        """
+        super().__init__()
+        self.linear = linear_layer
+        self.norm = norm_layer
+        self.act_type = act_type
+        self.act_name = act_name
+
+        if act_name == "sine":
+            self.activation = torch.sin
+        elif act_name == "selu":
+            self.activation = nn.SELU()
+        elif act_name == "sigmoid":
+            self.activation = nn.Sigmoid()
+        elif act_name == "tanh":
+            self.activation = nn.Tanh()
+        elif act_name == "relu":
+            self.activation = nn.ReLU()
+        elif act_name == "golu":
+            self.activation = GoLU()
+        elif act_name == "cone":
+            self.activation = Cone()
+        elif act_name == "prelu":
+            self.activation = nn.PReLU()
+        elif act_name == "lrelu0_01":
+            self.activation = nn.LeakyReLU(0.01)
+        elif act_name == "lrelu0_2":
+            self.activation = nn.LeakyReLU(0.2)
+        elif act_name == "lrelum1":
+            self.activation = nn.LeakyReLU(-1)
+        elif act_name == "silu":
+            self.activation = nn.SiLU()
+        elif act_name == "gelu":
+            self.activation = nn.GELU()
+        elif act_name == "telu":
+            self.activation = TeLU()
+        elif act_name == "square":
+            self.activation = TheSquare()
+        elif act_name == "gsin":
+            self.activation = GSine()
+        elif act_name == "gcos":
+            self.activation = GCosine()
+        elif act_name == "helu":
+            self.activation = HeLU()
+        elif act_name == "sign":
+            self.activation = Sign()
+        elif act_name == "aglu":
+            self.activation = AGLU()
+        elif act_name == "pawel":
+            self.activation = PaWeL(32)
+        elif act_name == "pcone":
+            self.activation = ParabolicCone()
+        elif act_name == "linear":
+            self.activation = nn.Identity()
+        else:
+            raise ValueError(f"Unknown act_name: {act_name}")
+
+    def init_weights(self, is_first=False, omega_0=30):
+        fan_in = self.linear.in_features
+        if self.act_name in ["sine", "gsin", "gcos"]:
+            if is_first:
+                nn.init.uniform_(self.linear.weight, -1/fan_in, 1/fan_in)
+            else:
+                bound = np.sqrt(6 / fan_in) / omega_0
+                nn.init.uniform_(self.linear.weight, -bound, bound)
+        elif self.act_name == "selu":
+            # Using Kaiming (which approximates LeCun normal for selu-like behavior)
+            nn.init.kaiming_normal_(self.linear.weight, nonlinearity='linear')
+        else:
+            # For sigmoid, tanh use their respective gains; for others default to ReLU gain.
+            if self.act_name in ["sigmoid", "tanh"]:
+                gain = nn.init.calculate_gain(self.act_name)
+            else:
+                gain = nn.init.calculate_gain("relu")
+            nn.init.xavier_uniform_(self.linear.weight, gain=gain)
+
+    def forward(self, x):
+        out = self.linear(x)
+        # Apply normalization if needed.
+        if not isinstance(self.norm, nn.Identity):
+            # For BatchNorm1d and InstanceNorm1d, reshape the tensor to (B*S, C)
+            if isinstance(self.norm, (nn.BatchNorm1d, nn.InstanceNorm1d)):
+                b, s, c = out.shape
+                out = self.norm(out.view(b * s, c)).view(b, s, c)
+            else:
+                out = self.norm(out)
+        if self.act_type == "glu":
+            # GLU variant: split into two halves and combine.
+            a, b = out.chunk(2, dim=-1)
+            out = a * self.activation(b)
+        else:
+            out = self.activation(out)
+        return out
+
+# The combined flexible PatchMLP class.
+class PatchMLP(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        layers,
+        max_seq_len,
+        pos_embed_type="trainable",  # Options: "nopos", "sine", "trainable", "siren"
+        act_name="relu",             # Options: "sine", "selu", "sigmoid", "tanh", "relu", "golu", "cone"
+        act_type="basic",            # Options: "basic", "glu"
+        res_type="nores",            # Options: "nores", "highway", "residual", "rezero"
+        norm_type="none",            # Options: "none", "batch", "instance", "layer", "rms"
+        omega_0=30                   # For sine initialization if act_name=="sine"
+    ):
+        """
+        A flexible PatchMLP model that applies an initial projection,
+        adds positional embeddings, passes through several MLP layers
+        (optionally using GLU, residual/highway/rezero connections, and normalization),
+        and finally projects back to the input dimension.
         """
         super().__init__()
         self.max_seq_len = max_seq_len
-        self.proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
-        # Learned positional embeddings.
-        self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, hidden_dim))
-        
-        # Build a list of linear layers for the network.
-        self.layers = nn.ModuleList()
-        # Create a corresponding drop path module for each layer.
-        self.drop_paths = nn.ModuleList()
-        
-        for i in range(layers):
-            if i == 0:
-                # First layer: map from input_dim to hidden_dim.
-                layer = nn.Linear(hidden_dim, hidden_dim)
-            elif i == layers - 1:
-                # Last layer: map from hidden_dim back to input_dim.
-                layer = nn.Linear(hidden_dim, input_dim)
-            else:
-                # Intermediate layers: maintain hidden dimension.
-                layer = nn.Linear(hidden_dim, hidden_dim)
-            self.layers.append(layer)
-            # Schedule drop path rate if multiple layers are used.
-            if layers > 1:
-                layer_drop_rate = drop_path_rate * i / (layers - 1)
-            else:
-                layer_drop_rate = 0.0
-            self.drop_paths.append(DropaPath(layer_drop_rate))
-        
-        # Activation function (assuming GoLU is defined elsewhere).
-        self.activation = GoLU()
+        self.pos_embed_type = pos_embed_type
+        self.act_name = act_name
+        self.act_type = act_type
+        self.res_type = res_type
+        self.norm_type = norm_type
+        self.omega_0 = omega_0
 
-    def forward(self, x, hidden=None):
+        # Initial projection: input_dim -> hidden_dim.
+        self.proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+
+        # Setup positional embeddings.
+        if pos_embed_type == "trainable":
+            self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, hidden_dim))
+        elif pos_embed_type == "sine":
+            pe = self.create_sinusoidal_embeddings(max_seq_len, hidden_dim)
+            self.register_buffer("pos_embedding", pe, persistent=False)
+        elif pos_embed_type == "nopos":
+            self.pos_embedding = None
+        else:
+            raise ValueError(f"Unknown pos_embed_type: {pos_embed_type}")
+
+        # Build MLP layers.
+        # We follow the convention that if layers==1, then the model only has a final layer
+        # (i.e. no hidden activation layers). Otherwise, we have (layers - 1) hidden layers plus one final layer.
+        num_hidden_layers = layers - 1 if layers > 1 else 0
+
+        self.layers = nn.ModuleList()
+        # For highway and rezero residual types, we need additional per-layer parameters.
+        if res_type == "highway":
+            self.highway_gates = nn.ModuleList()
+        if res_type == "rezero":
+            self.rezero_alphas = nn.ParameterList()
+
+        for i in range(num_hidden_layers):
+            # If using a GLU variant, the linear layer must output 2 * hidden_dim.
+            out_dim = hidden_dim * 2 if act_type == "glu" else hidden_dim
+            linear_layer = nn.Linear(hidden_dim, out_dim)
+            norm_layer = self.get_norm_layer(hidden_dim)
+            block = FlexibleMLPBlock(linear_layer, norm_layer, act_type, act_name)
+            self.layers.append(block)
+            if res_type == "highway":
+                self.highway_gates.append(nn.Linear(hidden_dim, hidden_dim))
+            if res_type == "rezero":
+                self.rezero_alphas.append(nn.Parameter(torch.zeros(1)))
+
+        # Final layer: hidden_dim -> input_dim (no activation, no residual, no norm).
+        self.final_layer = nn.Linear(hidden_dim, input_dim)
+
+        # Initialize weights.
+        self.initialize_weights()
+
+        # For "siren" pos embeds, use a SIREN-style initialization.
+        if pos_embed_type == "siren":
+            bound = 1 / hidden_dim
+            nn.init.uniform_(self.pos_embedding, -bound, bound)
+
+    def create_sinusoidal_embeddings(self, max_seq_len, hidden_dim):
+        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)  # (max_seq_len, 1)
+        div_term = torch.exp(torch.arange(0, hidden_dim, 2, dtype=torch.float) * -(math.log(10000.0) / hidden_dim))
+        pe = torch.zeros(max_seq_len, hidden_dim)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe.unsqueeze(0)  # (1, max_seq_len, hidden_dim)
+
+    def get_norm_layer(self, num_features):
+        if self.norm_type == "none":
+            return nn.Identity()
+        elif self.norm_type == "batch":
+            return nn.BatchNorm1d(num_features)
+        elif self.norm_type == "instance":
+            return nn.InstanceNorm1d(num_features)
+        elif self.norm_type == "layer":
+            return nn.LayerNorm(num_features)
+        elif self.norm_type == "rms":
+            # Assume RMSNorm is defined elsewhere.
+            return RMSNorm(num_features)
+        else:
+            raise ValueError(f"Unknown norm_type: {self.norm_type}")
+
+    def initialize_weights(self):
+        # Initialize the projection layer.
+        if isinstance(self.proj, nn.Linear):
+            self.init_layer(self.proj, is_first=True)
+        # Initialize each MLP block.
+        for i, block in enumerate(self.layers):
+            block.init_weights(is_first=(i == 0), omega_0=self.omega_0)
+        # Initialize the final layer using Xavier.
+        nn.init.xavier_uniform_(self.final_layer.weight)
+
+    def init_layer(self, layer, is_first=False):
+        fan_in = layer.in_features
+        if self.act_name == "sine":
+            if is_first:
+                nn.init.uniform_(layer.weight, -1 / fan_in, 1 / fan_in)
+            else:
+                bound = np.sqrt(6 / fan_in) / self.omega_0
+                nn.init.uniform_(layer.weight, -bound, bound)
+        elif self.act_name == "selu":
+            nn.init.kaiming_normal_(layer.weight, nonlinearity='linear')
+        else:
+            if self.act_name in ["sigmoid", "tanh"]:
+                gain = nn.init.calculate_gain(self.act_name)
+            else:
+                gain = nn.init.calculate_gain("relu")
+            nn.init.xavier_uniform_(layer.weight, gain=gain)
+
+    def forward(self, x):
         """
         Args:
-            x (Tensor): Input tensor of shape (batch, seq_len, input_dim)
+            x (Tensor): Shape (batch, seq_len, input_dim)
         Returns:
-            Tensor: Output tensor of shape (batch, seq_len, output_dim)
+            Tensor: Shape (batch, seq_len, input_dim)
         """
-        seq_len = x.shape[1]
-        # Add positional embeddings.
-        pos_emb = self.pos_embedding[:, :seq_len, :]
-        x = self.proj(x) + pos_emb
-        
-        # Apply each linear layer with a conditional residual connection.
-        for i, layer in enumerate(self.layers):
-            residual = x
-            out = layer(x)
-            # For intermediate layers, apply the activation.
-            if i < len(self.layers) - 1:
-                out = self.activation(out)
-            # Apply the residual connection if the dimensions match.
-            if residual.shape[-1] == out.shape[-1]:
-                x = residual + self.drop_paths[i](out)
-            else:
-                x = out
-        return x
+        batch, seq_len, _ = x.shape
+        # Project input and add positional embedding.
+        x_proj = self.proj(x)  # (batch, seq_len, hidden_dim)
+        if self.pos_embed_type == "nopos":
+            pos_emb = 0
+        else:
+            # For "trainable", "sine", and "siren" we use the parameter or buffer.
+            pos_emb = self.pos_embedding[:, :seq_len, :]
+        x = x_proj + pos_emb
+
+        # Pass through each hidden layer block.
+        for i, block in enumerate(self.layers):
+            if self.res_type == "highway":
+                residual = x
+                out = block(x)
+                gate = torch.sigmoid(self.highway_gates[i](x))
+                x = gate * out + (1 - gate) * residual
+            elif self.res_type == "rezero":
+                residual = x
+                out = block(x)
+                alpha = self.rezero_alphas[i]
+                x = residual + alpha * out
+            elif self.res_type == "residual":
+                residual = x
+                out = block(x)
+                x = x + out
+            else:  # "nores"
+                x = block(x)
+        # Final projection.
+        return self.final_layer(x)
+
 
 import torch
 import torch.nn as nn
@@ -1774,12 +2214,91 @@ class PatchMaskedCNN(nn.Module):
 #############################################
 # Model Selection and Training
 #############################################
-def select_model(model_type, patch_vector_dim, hidden_dim, layers, max_seq_len=None, cell_type=None, attn_heads=8):
+def select_model(model_type, patch_vector_dim, hidden_dim, layers, max_seq_len=None, attn_heads=8, pos_embed_type="trainable", act_name="relu", act_type="basic", res_type="nores", norm_type="none"):
     """
     Select the architecture based on user input:
     "1" = LSTM, "2" = GRU, "3" = minGRU (multilayered), "4" = MLP (with positional embeddings), "5" = Transformer,
     "6" = RNN (will choose celltype after this), "7" = Residual MLP, "8" = AliBi Transformer, "9" = Modern Transformer.
+        pos_embed_type="trainable",  # Options: "nopos", "sine", "trainable", "siren"
+        act_name="relu",             # Options: "sine", "selu", "sigmoid", "tanh", "relu", "golu", "cone"
+        act_type="basic",            # Options: "basic", "glu"
+        res_type="nores",            # Options: "nores", "highway", "residual", "rezero"
+        norm_type="none",            # Options: "none", "batch", "instance", "layer", "rms"
     """
+    if norm_type == "0":
+        norm_type = "none"
+    if norm_type == "1":
+        norm_type = "instance"
+    if norm_type == "2":
+        norm_type = "batch"
+    if norm_type == "3":
+        norm_type = "rms"
+    if norm_type == "4":
+        norm_type = "layer"
+    if res_type == "0":
+        res_type = "nores"
+    if res_type == "1":
+        res_type = "highway"
+    if res_type == "2":
+        res_type = "residual"
+    if res_type == "3":
+        res_type = "rezero"
+    if act_type == "0":
+        act_type = "basic"
+    if act_type == "1":
+        act_type = "glu"
+    if pos_embed_type == "0":
+        pos_embed_type = "nopos"
+    if pos_embed_type == "1":
+        pos_embed_type = "sine"
+    if pos_embed_type == "2":
+        pos_embed_type = "trainable"
+    if act_name == "0":
+        act_name = "sigmoid"
+    if act_name == "1":
+        act_name = "tanh"
+    if act_name == "2":
+        act_name = "sine"
+    if act_name == "3":
+        act_name = "relu"
+    if act_name == "4":
+        act_name = "selu"
+    if act_name == "5":
+        act_name = "cone"
+    if act_name == "6":
+        act_name = "golu"
+    if act_name == "7":
+        act_name = "prelu"
+    if act_name == "8":
+        act_name = "lrelu0_01"
+    if act_name == "9":
+        act_name = "lrelu0_2"
+    if act_name == "10":
+        act_name = "lrelum1"
+    if act_name == "11":
+        act_name = "silu"
+    if act_name == "12":
+        act_name = "gelu"
+    if act_name == "13":
+        act_name = "telu"
+    if act_name == "14":
+        act_name = "square"
+    if act_name == "15":
+        act_name = "gsin"
+    if act_name == "16":
+        act_name = "gsin"
+    if act_name == "17":
+        act_name = "helu"
+    if act_name == "18":
+        act_name = "sign"
+    if act_name == "19":
+        act_name = "aglu"
+    if act_name == "20":
+        act_name = "pawel"
+    if act_name == "21":
+        act_name = "pcone"
+    if act_name == "22":
+        act_name = "linear"
     if model_type == "1":
         return PatchLSTM(patch_vector_dim, hidden_dim, layers)
     elif model_type == "2":
@@ -1787,26 +2306,18 @@ def select_model(model_type, patch_vector_dim, hidden_dim, layers, max_seq_len=N
     elif model_type == "3":
         return MultiLayerMinGRU(patch_vector_dim, hidden_dim, num_layers=layers)
     elif model_type == "4":
-        if max_seq_len is None:
-            max_seq_len = 1024  # fallback default
-        return PatchMLP(patch_vector_dim, hidden_dim, layers, max_seq_len)
+        return PatchMLP(patch_vector_dim, hidden_dim, layers, max_seq_len, pos_embed_type=pos_embed_type, act_name=act_name, act_type=act_type, res_type=res_type, norm_type=norm_type)
     elif model_type == "5":
-        return PatchTransformer(patch_vector_dim, hidden_dim, layers, attn_heads, max_seq_len)
+        return PatchTransformer(patch_vector_dim, hidden_dim, layers, attn_heads, max_seq_len, pos_embed_type)
     elif model_type == "6":
-        return PatchRNN(patch_vector_dim, hidden_dim, layers, max_seq_len, cell_type)
-    elif model_type == "7":
-        if max_seq_len is None:
-            max_seq_len = 1024  # fallback default
-        return ResidualPatchMLP(patch_vector_dim, hidden_dim, layers, max_seq_len)
-    elif model_type == "8":
         return PatchAliBi(patch_vector_dim, hidden_dim, layers, attn_heads, max_seq_len)
-    elif model_type == "9":
+    elif model_type == "7":
         return ModernPatchTransformer(patch_vector_dim, hidden_dim, layers, attn_heads, max_seq_len)
-    elif model_type == "10":
+    elif model_type == "8":
         return PatchedGNN(patch_vector_dim, layers, hidden_dim)
-    elif model_type == "11":
+    elif model_type == "9":
         return PatchedMamba(patch_vector_dim, hidden_dim, layers, attn_heads)
-    elif model_type == "12":
+    elif model_type == "10":
         return PatchMaskedCNN(patch_vector_dim, hidden_dim, layers)
     else:
         raise ValueError("Invalid model type selection.")
@@ -1841,6 +2352,11 @@ def train_model(config, cont=False):
     attn_heads = config['attn_heads']
     cell_number = config['cell_number']
     batch_size = config.get('batch_size', 1)
+    pos_embed_type = config['pos']
+    act_name = config['act']
+    act_type = config['act_type']
+    res_type = config['res']
+    norm_type = config['norm']
 
     if model_type == "6":
         if cell_number == "1":
@@ -1856,17 +2372,17 @@ def train_model(config, cont=False):
     else:
         cell_type = None
 
-    model = select_model(model_type, patch_vector_dim, hidden_dim, layers, max_seq_len, cell_type, attn_heads).to(device)
+    model = select_model(model_type, patch_vector_dim, hidden_dim, layers, max_seq_len, attn_heads, pos_embed_type, act_name, act_type, res_type, norm_type).to(device)
     lr = 0.0006
-    if model_type in ['4', '7', '10', '12']: #MLPs
+    if model_type in ['4', '8', '10']: #MLPs
         lr = 0.0006
-    elif model_type in ['1']: #LSTMs
-        lr = 0.004
-    elif model_type in ['2', '6']: #RNNs
-        lr = 0.0006
+    elif model_type in ['1']: #LSTM
+        lr = 0.006
+    elif model_type in ['2']: #GRU
+        lr = 0.006
     elif model_type in ['3']: #MinGRU
-        lr = 0.0006
-    elif model_type in ['5', '8', '9', '11']: #Tranformers
+        lr = 0.006
+    elif model_type in ['5', '6', '7', '9']: #Tranformers
         lr = 0.0006
     if device.type == 'cuda':
         from deepspeed.ops.adam import FusedAdam
@@ -1902,6 +2418,7 @@ def train_model(config, cont=False):
             output = res[0] if isinstance(res, tuple) else res
             loss = criterion(output, target_seq_tensor) * 100
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             lr_current = optimizer.param_groups[0]['lr']
@@ -1953,8 +2470,13 @@ def sample_model():
     attn_heads = config['attn_heads']
     model_type = config['model_type']
     max_seq_len = config['max_seq_len']
+    pos_embed_type = config['pos']
+    act_name = config['act']
+    act_type = config['act_type']
+    res_type = config['res']
+    norm_type = config['norm']
     
-    model = select_model(model_type, patch_vector_dim, hidden_dim, layers, max_seq_len, attn_heads=attn_heads).to(device)
+    model = select_model(model_type, patch_vector_dim, hidden_dim, layers, max_seq_len, attn_heads, pos_embed_type, act_name, act_type, res_type, norm_type).to(device)
     model.load_state_dict(torch.load("model.pth", map_location=device))
     model.eval()
 
@@ -2031,19 +2553,36 @@ def main():
         elif patch_mode == 2:
             patch_width = int(input("Enter patch width for columnwise patches: ").strip())
             patch_height = None
-
         model_type = input(
-            "Choose model:\n(1) Long Short Term Memory\n(2) Gated Recurrent Unit\n(3) minGRU\n(4) Multi-Layered Perceptro\n(5) GPT-2 Transformer\n"
-            "(6) RNN (will choose cell type after this)\n(7) Residual MLP\n"
-            "(8) AliBi Transformer\n(9) Modern, Rotary pos embedded transformer\n(10) Graph Neural Network\n(11) Mamba\n(12) Pretty much Causal Convnet\n"
+            "Choose model:\n(1) Long Short Term Memory\n(2) Gated Recurrent Unit\n(3) minGRU\n(4) Multi-Layered Perceptron\n(5) GPT-2 Transformer\n(6) AliBi Transformer\n(7) Modern, Rotary pos embedded transformer\n(8) Graph Neural Network\n(9) Mamba\n(10) Pretty much Causal Convnet\n"
         ).strip()
         if model_type == "6":
             cell_number = input("Choose RNN cell\n(1) Light recurrent unit\n(2) IndyGRU\n(3) IndRNN\n(4) RRU\n ").strip()
         else:
             cell_number = "0"
-        
+
+        if model_type in ["4", "5"]:
+            pos_embed_type = input("Pos embed type\n(0) NoPos\n(1) Sinusoidal Positional Embeddings\n(2) Trainable positional embeddings\n").strip()
+        else:
+            pos_embed_type = "nopos"
+        if model_type == "4":
+            act_name = input("Choose activation function\n(0) Sigmoid\n(1) Hyperbolic Tangent\n(2) Sine\n(3) Rectified Linear Unit\n(4) Scaled Exponentional Linear Unit, self-normalizes\n(5) Cone Activation Function\n(6) Gombertz Linear Unit\n(7) Parametric ReLU\n(8) LeakyRELU 0.01\n(9) LeakyReLU 0.2\n(10) LeakyReLU -1\n(11) Sigmoid Linear Unit\n(12) Gaussian Error Linear Unit\n(13) TeLU\n(14) The Square\n(15) Growing sine\n(16) Growing cosine\n(17) HeLU, ReLU woith custom backprop\n(18) Sign activation (more of a joke entry)\n(19) Adaptive Gated Linear Unit (AGLU)\n(20) Trainable piecewise linear unit\n(21) Parabolic Cone\n(22) No activation (Linear)\n").strip()
+            act_type = input("Type of activation\n(0) Normal\n(1) GLU Variant\n").strip()
+            res_type = input("Residual Type\n(0) No residuals\n(1) Highway connections\n(2) Standard residual\n(3) ReZero Resdiual\n").strip()
+            norm_type = input("Normalization technique\n(0) No norm\n(1) Instance Normalization\n(2) Batch Normalization\n(3) RMSNorm\n(4) Layernorm\n").strip()
+        else:
+            act_name="relu"
+            act_type="basic"
+            res_type="nores"
+            norm_type="none"
+
         config = {
             'image_dir': imdir,
+            'pos': pos_embed_type,
+            'act': act_name,
+            'act_type': act_type,
+            'res': res_type,
+            'norm': norm_type,
             'image_size': image_size,
             'patch_mode': patch_mode,
             'hidden_dim': int(input("Enter hidden dimension: ").strip()),

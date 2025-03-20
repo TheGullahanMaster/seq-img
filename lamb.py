@@ -276,7 +276,7 @@ class GrokFastAdamW(Optimizer):
         eps=1e-8,
         regen_reg_rate=0.,
         grokfast=True,
-        grokfast_alpha=0.98,
+        grokfast_alpha=0.998,
         grokfast_lamb=2.,
         grokfast_after_step=0,
         normalize_lr=False
@@ -6395,7 +6395,7 @@ class HeLUFunction(torch.autograd.Function):
         return grad_input * grad_output, None
 
 class HeLU(nn.Module):
-    def __init__(self, alpha=0.001):
+    def __init__(self, alpha=0.05):
         """
         Initializes the HeLU activation function module.
         
@@ -6440,7 +6440,7 @@ class TheSquare(nn.Module):
         self.coord = nn.Parameter(torch.zeros(2))
         self.tanh = nn.Tanh()
         self.silu = TeLU()
-        self.sine = DRA()
+        self.sine = Sine()
         self.cone = Cone()
     
     def __repr__(self) -> str:
@@ -6897,152 +6897,3 @@ class AdamWScheduleFree(torch.optim.Optimizer):
 
             group['k'] = k+1
         return loss
-class NovoGrad(Optimizer):
-    """Implements NovoGrad algorithm.
-    Arguments:
-        params (iterable): iterable of parameters to optimize or dicts defining
-            parameter groups
-        lr (float, optional): learning rate (default: 1e-2)
-        betas (Tuple[float, float], optional): coefficients used for computing
-            running averages of gradient and its square (default: (0.95, 0.98))
-        eps (float, optional): term added to the denominator to improve
-            numerical stability (default: 1e-8)
-        weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
-    Example:
-        >>> model = ResNet()
-        >>> optimizer = NovoGrad(model.parameters(), lr=1e-2, weight_decay=1e-5)
-    """
-
-    def __init__(self, params, lr=0.01, betas=(0.95, 0.98), eps=1e-8,
-                 weight_decay=0,grad_averaging=False):
-        if lr < 0.0:
-            raise ValueError("Invalid learning rate: {}".format(lr))
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
-        defaults = dict(lr=lr, betas=betas, eps=eps,weight_decay=weight_decay,grad_averaging = grad_averaging)
-        super().__init__(params, defaults)
-
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            loss = closure()
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                grad = p.grad.data
-                if grad.is_sparse:
-                    raise RuntimeError('NovoGrad does not support sparse gradients')
-                state = self.state[p]
-                g_2 = torch.sum(grad ** 2)
-                if len(state) == 0:
-                    state['step'] = 0
-                    state['moments'] = grad.div(g_2.sqrt() +group['eps']) + \
-                                       group['weight_decay'] * p.data
-                    state['grads_ema'] = g_2
-                moments = state['moments']
-                grads_ema = state['grads_ema']
-                beta1, beta2 = group['betas']
-                state['step'] += 1
-                grads_ema.mul_(beta2).add_(1 - beta2, g_2)
-
-                denom = grads_ema.sqrt().add_(group['eps'])
-                grad.div_(denom)
-                # weight decay
-                if group['weight_decay'] != 0:
-                    decayed_weights = torch.mul(p.data, group['weight_decay'])
-                    grad.add_(decayed_weights)
-
-                # Momentum --> SAG
-                if group['grad_averaging']:
-                    grad.mul_(1.0 - beta1)
-
-                moments.mul_(beta1).add_(grad) # velocity
-
-                bias_correction1 = 1 - beta1 ** state['step']
-                bias_correction2 = 1 - beta2 ** state['step']
-                step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
-                p.data.add_(-step_size, moments)
-
-        return loss
-class STAFI(nn.Module):
-    def __init__(self, num_features, tau=25, init_omega=1.0):
-        """
-        Per-feature STAF activation function.
-        
-        Args:
-            num_features (int): Number of input features (channels).
-            tau (int): Number of Fourier terms per feature.
-            init_omega (float): Initial value for the frequency parameters.
-        """
-        super(STAFI, self).__init__()
-        self.num_features = num_features
-        self.tau = tau
-
-        # Each feature gets its own set of parameters with shape [num_features, tau]
-        self.C = nn.Parameter(torch.ones(num_features, tau))         # Amplitudes, initialized to 1.
-        self.Omega = nn.Parameter(torch.ones(num_features, tau) * init_omega)  # Frequencies.
-        self.Phi = nn.Parameter(torch.zeros(num_features, tau))        # Phases.
-
-    def forward(self, x):
-        """
-        Forward pass of the per-feature STAF activation.
-        
-        Args:
-            x (torch.Tensor): Input tensor of shape [batch, num_features].
-            
-        Returns:
-            torch.Tensor: Output tensor of shape [batch, num_features].
-        """
-        # x shape: [batch, num_features]
-        # Expand x to have an extra dimension for tau terms: shape becomes [batch, num_features, 1]
-        x_expanded = x.unsqueeze(-1)
-        # Reshape parameters for broadcasting: add batch dimension.
-        # self.Omega and self.Phi have shape [num_features, tau] -> [1, num_features, tau]
-        Omega = self.Omega.unsqueeze(0)
-        Phi = self.Phi.unsqueeze(0)
-        C = self.C.unsqueeze(0)
-        
-        # Compute the Fourier series per feature: sin(Omega * x + Phi) then scale by C.
-        # Resulting shape: [batch, num_features, tau]
-        out = torch.sin(x_expanded * Omega + Phi) * C
-        
-        # Sum over the tau dimension to obtain a per-feature activation.
-        # Final output shape: [batch, num_features]
-        return torch.sum(out, dim=-1)
-class STAF(nn.Module):
-    def __init__(self, tau=25, init_omega=1.0):
-        """
-        STAF activation function.
-
-        Args:
-            tau (int): Number of Fourier terms.
-            init_omega (float): Initial value for the frequency parameters.
-        """
-        super(STAF, self).__init__()
-        self.tau = tau
-        # Initialize amplitudes (C), frequencies (Omega), and phases (Phi)
-        self.C = nn.Parameter(torch.ones(tau))  # amplitude parameters, initialized to 1
-        self.Omega = nn.Parameter(torch.ones(tau) * init_omega)  # frequency parameters
-        self.Phi = nn.Parameter(torch.zeros(tau))  # phase parameters
-
-    def forward(self, x):
-        """
-        Forward pass of the STAF activation.
-        
-        Args:
-            x (torch.Tensor): Input tensor.
-            
-        Returns:
-            torch.Tensor: Output tensor after applying the STAF activation.
-        """
-        # x: shape [*, ...]
-        # We expand x with a new last dimension for the Fourier terms:
-        # resulting shape will be [..., 1] which broadcasts with [tau]
-        # Compute sin(Omega * x + Phi) for each term and multiply by amplitude C
-        # Then sum over the Fourier terms (last dimension)
-        # Note: The parameters are automatically broadcast.
-        out = torch.sin(x.unsqueeze(-1) * self.Omega + self.Phi) * self.C
-        return torch.sum(out, dim=-1)
